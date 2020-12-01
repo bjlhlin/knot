@@ -236,9 +236,16 @@ Type *item* parameter in the form of *section*\ [**[**\ *id*\ **]**\ ][**.**\ *n
 
 The *-b* and *-f* options can be placed right after the command name.
 
-The *OK* response to triggering commands means that the command has been successfully sent
-to the server. To verify if the operation succeeded it's necessary to check the server
-log.
+Responses returned by *knotc* commands are different for the blocking and the standard
+(i. e. non-blocking) modes of operation. In the blocking mode, *knotc* reports if
+an error occurred during processing of the command by the server. If an error is
+reported, a more detailed information about the failure can usually be found in the
+server log.
+
+In the standard (non-blocking) mode, *knotc* doesn't report processing errors.
+The *OK* response to triggering commands in the standard mode means that the command has
+been successfully sent to the server. To verify if the operation succeeded it's necessary
+to check the server log.
 
 Interactive mode
 ................

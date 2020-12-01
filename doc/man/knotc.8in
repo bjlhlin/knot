@@ -258,9 +258,16 @@ Type \fIitem\fP parameter in the form of \fIsection\fP[\fB[\fP\fIid\fP\fB]\fP][\
 .sp
 The \fI\-b\fP and \fI\-f\fP options can be placed right after the command name.
 .sp
-The \fIOK\fP response to triggering commands means that the command has been successfully sent
-to the server. To verify if the operation succeeded it\(aqs necessary to check the server
-log.
+Responses returned by \fIknotc\fP commands are different for the blocking and the standard
+(i. e. non\-blocking) modes of operation. In the blocking mode, \fIknotc\fP reports if
+an error occurred during processing of the command by the server. If an error is
+reported, a more detailed information about the failure can usually be found in the
+server log.
+.sp
+In the standard (non\-blocking) mode, \fIknotc\fP doesn\(aqt report processing errors.
+The \fIOK\fP response to triggering commands in the standard mode means that the command has
+been successfully sent to the server. To verify if the operation succeeded it\(aqs necessary
+to check the server log.
 .SS Interactive mode
 .sp
 The utility provides interactive mode with basic line editing functionality,
