@@ -65,6 +65,7 @@ typedef struct zone_events {
 	time_t time[ZONE_EVENT_COUNT];	//!< Event execution times.
 	bool forced[ZONE_EVENT_COUNT];  //!< Flag that the event was invoked by user ctl.
 	pthread_cond_t *blocking[ZONE_EVENT_COUNT];       //!< For blocking events: dispatching cond.
+	int result[ZONE_EVENT_COUNT];   //!< Event return values (in blocking operations).
 } zone_events_t;
 
 /*!
@@ -148,8 +149,10 @@ void zone_events_schedule_user(struct zone *zone, zone_event_type_t type);
  * \param zone  Zone to schedule new event for.
  * \param type  Zone event type.
  * \param user  Forced flag indication.
+ *
+ * \return KNOT_E*
  */
-void zone_events_schedule_blocking(struct zone *zone, zone_event_type_t type, bool user);
+int zone_events_schedule_blocking(struct zone *zone, zone_event_type_t type, bool user);
 
 /*!
  * \brief Freeze all zone events and prevent new events from running.
