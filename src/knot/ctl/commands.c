@@ -588,10 +588,9 @@ static int zone_txn_begin(zone_t *zone, ctl_args_t *args)
 	if (ret != KNOT_EOK) {
 		free(zone->control_update);
 		zone->control_update = NULL;
-		return ret;
 	}
 
-	return KNOT_EOK;
+	return ret;
 }
 
 static int zone_txn_commit(zone_t *zone, ctl_args_t *args)
@@ -937,11 +936,8 @@ static int send_changeset(changeset_t *ch, send_ctx_t *ctx)
 
 	// Second send 'to' changeset part.
 	ret = send_changeset_part(ch, ctx, false);
-	if (ret != KNOT_EOK) {
-		return ret;
-	}
 
-	return KNOT_EOK;
+	return ret;
 }
 
 static int zone_txn_diff(zone_t *zone, ctl_args_t *args)
