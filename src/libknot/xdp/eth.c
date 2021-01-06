@@ -70,6 +70,36 @@ int knot_eth_queues(const char *devname)
 }
 
 _public_
+int knot_eth_mtu(const char *devname)
+{
+	if (devname == NULL) {
+		return KNOT_EINVAL;
+	}
+
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		return knot_map_errno();
+	}
+
+	struct ifreq ifr = { 0 };
+	strlcpy(ifr.ifr_name, devname, IFNAMSIZ);
+
+	int ret = ioctl(fd, SIOCGIFMTU, &ifr);
+	if (ret != 0) {
+		if (errno == EOPNOTSUPP) {
+			ret = 1;
+		} else {
+			ret = knot_map_errno();
+		}
+	} else {
+		ret = ifr.ifr_mtu;
+	}
+
+	close(fd);
+	return ret;
+}
+
+_public_
 int knot_eth_name_from_addr(const struct sockaddr_storage *addr, char *out,
                             size_t out_len)
 {
