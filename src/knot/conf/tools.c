@@ -348,6 +348,47 @@ int check_module_id(
 	} \
 }
 
+static int check_mtu(knotd_conf_check_args_t *args, conf_val_t *xdp)
+{
+#ifndef ENABLE_XDP
+		return KNOT_ENOTSUP;
+#else
+	conf_xdp_iface_t ifc;
+
+	conf_val_t conf_udp_payload = conf_get_txn(args->extra->conf, args->extra->txn, C_SRV,
+	                              C_UDP_MAX_PAYLOAD_IPV4);
+	const uint64_t udp_payload = conf_int(&conf_udp_payload);
+	conf_val_t conf_udp6_payload = conf_get_txn(args->extra->conf, args->extra->txn, C_SRV,
+	                              C_UDP_MAX_PAYLOAD_IPV6);
+	const uint64_t udp6_payload = conf_int(&conf_udp6_payload);
+
+	size_t count = conf_val_count(xdp);
+	while (xdp->code == KNOT_EOK && count-- >= 1) {
+		struct sockaddr_storage addr = conf_addr(xdp, NULL);
+		int ret = conf_xdp_iface(&addr, &ifc);
+		if (ret != KNOT_EOK) {
+			return ret;
+		}
+		int mtu = knot_eth_mtu(ifc.name);
+		if (mtu < 0) {
+			args->err_str = "unable to read MTU from device";
+			return KNOT_EINVAL;
+		} else if (mtu > KNOT_XDP_MAX_MTU) {
+			args->err_str = "MTU is bigger than maximal MTU value";
+			return KNOT_EINVAL;
+		}
+
+		if (mtu < udp_payload || mtu < udp6_payload) {
+			args->err_str = "UDP payload can't be higher than settup MTU";
+			return KNOT_EINVAL;
+		}
+		conf_val_next(xdp);
+	}
+
+	return KNOT_EOK;
+#endif
+}
+
 int check_server(
 	knotd_conf_check_args_t *args)
 {
@@ -355,8 +396,14 @@ int check_server(
 	                                 C_LISTEN);
 	conf_val_t xdp = conf_get_txn(args->extra->conf, args->extra->txn, C_SRV,
 	                              C_LISTEN_XDP);
-	if (xdp.code == KNOT_EOK && listen.code != KNOT_EOK) {
-		CONF_LOG(LOG_WARNING, "unable to process TCP queries due to XDP-only interfaces");
+	if (xdp.code == KNOT_EOK) {
+		if (listen.code != KNOT_EOK) {
+			CONF_LOG(LOG_WARNING, "unable to process TCP queries due to XDP-only interfaces");
+		}
+		int ret = check_mtu(args, &xdp);
+		if (ret != KNOT_EOK && ret != KNOT_ENOTSUP) {
+			CONF_LOG(LOG_WARNING, "wrong MTU settings for XDP interface");
+		}
 	}
 
 	conf_val_t hshake = conf_get_txn(args->extra->conf, args->extra->txn, C_SRV,
