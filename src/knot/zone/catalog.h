@@ -31,14 +31,6 @@ typedef struct catalog {
 	knot_lmdb_txn_t *old_ro_txn;
 } catalog_t;
 
-typedef enum {
-	MEMBER_NONE,   // this member zone is not in any catalog
-	MEMBER_EXACT,  // this member zone precisely matches lookup
-	MEMBER_ZONE,   // this member zone is in different catalog
-	MEMBER_OWNER,  // this member zone is in same catalog with diferent owner
-	MEMBER_ERROR,  // find error code in cat->txn.ret
-} catalog_find_res_t;
-
 typedef struct {
 	trie_t *upd;             // tree of catalog_upd_val_t, that gonna be changed in catalog
 	int error;               // error occured during generating of upd
@@ -49,8 +41,13 @@ typedef enum {
 	MEMB_UPD_INVALID,   // invalid value
 	MEMB_UPD_ADD,       // member addition
 	MEMB_UPD_REM,       // member removal
-	MEMB_UPD_MINOR,     // owner or catzone change, uniqID preserved
-	MEMB_UPD_UNIQ,      // uniqID change
+
+	MEMB_UPD_ORIG,      // original state of catalog member
+	MEMB_UPD_ADD_EFFECT,// member addition with getting into effect
+	MEMB_UPD_UPD_EFFECT,// effective member updated
+	MEMB_UPD_UPD_PURGE, // effective member updated, purge member zone
+	MEMB_UPD_REM_EFFECT,
+
 	MEMB_UPD_MAX,       // number of options in ths enum
 } catalog_upd_type_t;
 
@@ -59,7 +56,8 @@ typedef struct catalog_upd_val {
 	knot_dname_t *owner;      // the owner of PTR record defining the member zone
 	knot_dname_t *catzone;    // the catalog zone the PTR is in
 	catalog_upd_type_t type;  // what kind of update this is
-	struct catalog_upd_val *counter; // original owner/catzone before this update
+	struct catalog_upd_val *next; // updates for one member name for a linked list
+	uint32_t ord;             // increasing counter for persistent catalog values for one member
 } catalog_upd_val_t;
 
 extern const MDB_val catalog_iter_prefix;
@@ -140,57 +138,46 @@ int catalog_deinit(catalog_t *cat);
  * \param member    Member zone name.
  * \param owner     Owner of the PTR record in catalog zone, respective to the member zone.
  * \param catzone   Name of the catalog zone whose it's the member.
+ * \param ord       Sequence number of this PTR record in relation to this member name.
  *
  * \return KNOT_E*
  */
 int catalog_add(catalog_t *cat, const knot_dname_t *member,
-                const knot_dname_t *owner, const knot_dname_t *catzone);
-
-inline static int catalog_add2(catalog_t *cat, const catalog_upd_val_t *val)
-{
-	return catalog_add(cat, val->member, val->owner, val->catzone);
-}
+                const knot_dname_t *owner, const knot_dname_t *catzone,
+                uint32_t ord);
 
 /*!
- * \brief Delete a member zone from the catalog database.
+ * \brief Delete first record for this member zone in catalog database.
  *
  * \param cat       Catalog to be removed from.
  * \param member    Member zone to be removed.
+ * \param ord       The PTR record info to be removed from those for this member name.
  *
  * \return KNOT_E*
  */
-int catalog_del(catalog_t *cat, const knot_dname_t *member);
+int catalog_del(catalog_t *cat, const knot_dname_t *member, uint32_t ord);
 
-inline static int catalog_del2(catalog_t *cat, const catalog_upd_val_t *val)
-{
-	assert(val->type != MEMB_UPD_ADD);
-	return catalog_del(cat, val->member);
-}
-
-#define catalog_foreach(cat) knot_lmdb_foreach((cat)->ro_txn, (MDB_val *)&catalog_iter_prefix)
-
+typedef int (*catalog_apply_cb_t)(const knot_dname_t *member, const knot_dname_t *owner,
+                                  const knot_dname_t *catz, uint32_t ord, void *ctx);
 /*!
- * \brief Deserialize a value in catalog database.
+ * \brief Iterate thourg catalog database, applying callback.
  *
- * \param cat       Catalog with cat->txn->cur_val to be deserialized.
- * \param member    Output: member zone.
- * \param owner     Output: PTR owner.
- * \param catzone   Output: catalog zone.
- */
-void catalog_curval(catalog_t *cat, const knot_dname_t **member,
-                    const knot_dname_t **owner, const knot_dname_t **catzone);
-
-/*!
- * \brief Get the catalog zone for known member zone.
- *
- * \param cat        Catalog database.
- * \param member     Member zone name.
- * \param catzone    Catalog zone holding the member zone.
+ * \param cat          Catalog to be iterated.
+ * \param for_member   (Optional) Iterate only on records for this member name.
+ * \param cb           Callback to be called.
+ * \param ctx          Context for this callback.
+ * \param rw           Use read-write transaction.
+ * \param shadowed     Iterate also over shadowed records.
  *
  * \return KNOT_E*
  */
-int catalog_get_zone(catalog_t *cat, const knot_dname_t *member,
-                     const knot_dname_t **catzone);
+int catalog_apply(catalog_t *cat, const knot_dname_t *for_member,
+		  catalog_apply_cb_t cb, void *ctx, bool rw, bool shadowed);
+
+/*!
+ * \brief Obtain whether this member is mentioned in any catalog zone.
+ */
+bool catalog_has_member(catalog_t *cat, const knot_dname_t *member);
 
 /*!
  * \brief Get the catalog zone for known member zone.
@@ -207,23 +194,10 @@ int catalog_get_zone_threadsafe(catalog_t *cat, const knot_dname_t *member,
                                 knot_dname_storage_t catzone);
 
 /*!
- * \brief Find specific member record in catalog database.
- *
- * \param cat        Catalog database.
- * \param member     Member zone to be searched for.
- * \param owner      Owner to be searched/verified.
- * \param catzone    Catalog zone to be searched/verified.
- *
- * \return see catalog_find_res_t
- */
-catalog_find_res_t catalog_find(catalog_t *cat, const knot_dname_t *member,
-                                const knot_dname_t *owner, const knot_dname_t *catzone);
-
-/*!
  * \brief Copy records from one catalog database to other.
  *
  * \param from            Catalog DB to copy from.
- * \param to              Catalog db to copy to.
+ * \param to              Catalog DB to copy to.
  * \param zone_only       Optional: copy only records for this catalog zone.
  * \param read_rw_txn     Use RW txn for read operations.
  *
@@ -277,7 +251,6 @@ int catalog_update_add(catalog_update_t *u, const knot_dname_t *member,
  *
  * \param u          Catalog update.
  * \param member     Member zone name.
- * \param remove     Search in remove section.
  *
  * \return Found update record for given member zone; or NULL.
  */
@@ -292,12 +265,23 @@ struct zone_contents;
  * \param zone         Zone contents to be searched for member PTR records.
  * \param remove       Add removals of found member zones.
  * \param check_ver    Do check catalog zone version record first.
- * \param check        Optional: existing catalog database to be checked for existence of such record (useful for removals).
  *
  * \return KNOT_E*
  */
 int catalog_update_from_zone(catalog_update_t *u, struct zone_contents *zone,
-                             bool remove, bool check_ver, catalog_t *check);
+                             bool remove, bool check_ver);
+
+/*!
+ * \brief Check changes in Catalog Update against state in persistent Catalog.
+ *
+ * ...and mark the exact nature of changes.
+ *
+ * \param u     Catalog update to be particularized.
+ * \param cat   Catalog to check against.
+ *
+ * \return KNOT_E*
+ */
+int catalog_update_finalize(catalog_update_t *u, catalog_t *cat);
 
 /*!
  * \brief Generate catalog zone contents from (full) catalog update.
@@ -333,6 +317,16 @@ int catalog_update_to_update(catalog_update_t *u, struct zone_update *zu);
  * \return KNOT_E*
  */
 int catalog_update_del_all(catalog_update_t *u, catalog_t *cat, const knot_dname_t *zone);
+
+/*!
+ * \brief Put changes from Catalog Update into persistent Catalog database.
+ *
+ * \param u      Catalog update to be commited.
+ * \param cat    Catalog to be updated.
+ *
+ * \return KNOT_E*
+ */
+int catalog_update_commit(catalog_update_t *u, catalog_t *cat);
 
 typedef trie_it_t catalog_it_t;
 

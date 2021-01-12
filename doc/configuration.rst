@@ -594,11 +594,14 @@ is transferable to secondary servers using common AXFR/IXFR techniques.
 *Catalog-member zone* (or just *member zone*) is a zone based on
 information from the catalog zone and not from configuration file/database.
 
+Catalog zone interpretation
+---------------------------
+
 A catalog zone is handled almost in the same way as a regular zone:
 It can be configured using all the standard options (but for example
 DNSSEC signing would be useless), including primary/secondary configuration
 and ACLs. A catalog zone is indicated by setting the option
-:ref:`zone_catalog-role`. The difference is that standard DNS
+:ref:`zone_catalog-role` to *interpret*. The difference is that standard DNS
 queries to a catalog zone are answered with REFUSED as though the zone
 doesn't exist, unless querying over TCP from an address with transfers enabled
 by ACL. The name of the catalog zone is arbitrary. It's possible to configure
@@ -649,20 +652,39 @@ When setting up catalog zones, it might be useful to set
 :ref:`database_catalog-db` and :ref:`database_catalog-db-max-size`
 to non-default values.
 
+Transferring member zone
+------------------------
+
+When the user desires to move a member zone from one catalog to another,
+following procedure is recommended. For example, this is handy when each catalog
+bears different member zones' configuration.
+
+#. Add the PTR record for the member also to the target catalog zone.
+#. Wait for this update to propagate through all servers interpreting this catalog zone.
+#. Remove the PTR record for the member from the original catalog zone.
+
+It still holds that the member zone's metadata will be purged if and only if
+the *<unique-id>* has been changed among the PTR records owner names.
+
+Catalog zone generation
+-----------------------
+
+In some catalog use-cases, generating the catalog zone is left to the user,
+for example based on some registration database.
+
+However, for the use-case of mirroring two (or more) servers' configuration,
+it may be handy to configure the primary server as the catalog zone generator,
+and the secondaries as interpreters.
+
+Catalog zone generation is configured by setting the option :ref:`zone_catalog-role`
+to *generate* for the generated catalog zone, which in turn does not need to
+have any zone file, and to *member* for the zones to become members of the catalog.
+It's also needed to set the option :ref:`zone_catalog-zone` for them even when
+there is just one catalg zone being generated.
+
 .. WARNING::
-
-   The server does not work well if one member zone appears in two catalog zones
-   concurrently. The user is encouraged to avoid this situation whatsoever.
-   Thus, there is no way a member zone can be migrated from one catalog
-   to another while preserving its metadata. Following steps may be used
-   as a workaround:
-
-   * :ref:`Back up<Data and metadata backup>` the member zone's metadata
-     (on each server separately).
-   * Remove the member zone from the catalog it's a member of.
-   * Wait for the catalog zone to be propagated to all servers.
-   * Add the member zone to the other catalog.
-   * Restore the backed up metadata (on each server separately).
+   Transferring of member zone safely between catalog zones is not supported with this
+   automatic catalog zone generation.
 
 .. _query-modules:
 

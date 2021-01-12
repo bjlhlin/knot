@@ -225,7 +225,8 @@ static int bailiwick_shift(const knot_dname_t *subname, const knot_dname_t *name
 }
 
 int catalog_add(catalog_t *cat, const knot_dname_t *member,
-                const knot_dname_t *owner, const knot_dname_t *catzone)
+                const knot_dname_t *owner, const knot_dname_t *catzone,
+                uint32_t ord)
 {
 	if (cat->rw_txn == NULL) {
 		return KNOT_EINVAL;
@@ -235,7 +236,7 @@ int catalog_add(catalog_t *cat, const knot_dname_t *member,
 		return KNOT_EOUTOFZONE;
 	}
 	assert(bail >= 0 && bail < 256);
-	MDB_val key = knot_lmdb_make_key("BN", 0, member); // 0 for future purposes
+	MDB_val key = knot_lmdb_make_key("BNI", 0, member, ord); // 0 for future purposes
 	MDB_val val = knot_lmdb_make_key("BBN", 0, bail, owner);
 
 	knot_lmdb_insert(cat->rw_txn, &key, &val);
@@ -244,42 +245,25 @@ int catalog_add(catalog_t *cat, const knot_dname_t *member,
 	return cat->rw_txn->ret;
 }
 
-int catalog_del(catalog_t *cat, const knot_dname_t *member)
+int catalog_del(catalog_t *cat, const knot_dname_t *member, uint32_t ord)
 {
 	if (cat->rw_txn == NULL) {
 		return KNOT_EINVAL;
 	}
-	MDB_val key = knot_lmdb_make_key("BN", 0, member);
-	knot_lmdb_del_prefix(cat->rw_txn, &key); // deletes one record
+	MDB_val key = knot_lmdb_make_key("BNI", 0, member, ord);
+	knot_lmdb_del_prefix(cat->rw_txn, &key);
 	free(key.mv_data);
 	return cat->rw_txn->ret;
 }
 
-void catalog_curval(catalog_t *cat, const knot_dname_t **member,
-                    const knot_dname_t **owner, const knot_dname_t **catzone)
-{
-	uint8_t zero, shift;
-	if (member != NULL) {
-		knot_lmdb_unmake_key(cat->ro_txn->cur_key.mv_data, cat->ro_txn->cur_key.mv_size,
-		                     "BN", &zero, member);
-	}
-	const knot_dname_t *ow;
-	knot_lmdb_unmake_curval(cat->ro_txn, "BBN", &zero, &shift, &ow);
-	if (owner != NULL) {
-		*owner = ow;
-	}
-	if (catzone != NULL) {
-		*catzone = ow + shift;
-	}
-}
-
-static void catalog_curval2(MDB_val *key, MDB_val *val, const knot_dname_t **member,
-                            const knot_dname_t **owner, const knot_dname_t **catzone)
+static void catalog_curval(MDB_val *key, MDB_val *val, const knot_dname_t **member,
+                           const knot_dname_t **owner, const knot_dname_t **catzone,
+                           uint32_t *ord)
 {
 	uint8_t zero, shift;
 	if (member != NULL) {
 		knot_lmdb_unmake_key(key->mv_data, key->mv_size,
-		                     "BN", &zero, member);
+		                     "BNI", &zero, member, ord);
 	}
 	const knot_dname_t *ow;
 	knot_lmdb_unmake_key(val->mv_data, val->mv_size, "BBN", &zero, &shift, &ow);
@@ -291,21 +275,124 @@ static void catalog_curval2(MDB_val *key, MDB_val *val, const knot_dname_t **mem
 	}
 }
 
-int catalog_get_zone(catalog_t *cat, const knot_dname_t *member,
-                     const knot_dname_t **catzone)
+typedef struct {
+	catalog_apply_cb_t cb;
+	void *ctx;
+	bool shadowed;
+	const knot_dname_t *last_member;
+} catalog_apply_ctx_t;
+
+static int catalog_apply_cb(MDB_val *key, MDB_val *val, void *ctx)
+{
+	catalog_apply_ctx_t *iter_ctx = ctx;
+	const knot_dname_t *mem, *ow, *cz;
+	uint32_t ord = 0;
+	catalog_curval(key, val, &mem, &ow, &cz, &ord);
+	if (iter_ctx->shadowed || !knot_dname_is_equal(mem, iter_ctx->last_member)) {
+		iter_ctx->last_member = mem;
+		return iter_ctx->cb(mem, ow, cz, ord, iter_ctx->ctx);
+	} else {
+		return KNOT_EOK;
+	}
+}
+
+int catalog_apply(catalog_t *cat, const knot_dname_t *for_member,
+		  catalog_apply_cb_t cb, void *ctx, bool rw, bool shadowed)
+{
+	MDB_val prefix = knot_lmdb_make_key(for_member == NULL ? "B" : "BN", 0, for_member);
+	catalog_apply_ctx_t iter_ctx = { cb, ctx, shadowed, NULL };
+	knot_lmdb_txn_t *use_txn = rw ? cat->rw_txn : cat->ro_txn;
+	int ret = knot_lmdb_apply_threadsafe(use_txn, &prefix, true, catalog_apply_cb, &iter_ctx);
+	free(prefix.mv_data);
+	return ret;
+}
+
+bool catalog_has_member(catalog_t *cat, const knot_dname_t *member)
+{
+	if (cat->ro_txn == NULL) {
+		return false;
+	}
+	MDB_val prefix = knot_lmdb_make_key("BN", 0, member);
+	bool res = knot_lmdb_find_prefix(cat->ro_txn, &prefix);
+	free(prefix.mv_data);
+	return res;
+}
+
+typedef struct {
+	catalog_upd_val_t **out_list;
+	catalog_upd_val_t **out_end;
+} cmtu_ctx_t;
+
+static int cmtu_add(const knot_dname_t *mem, const knot_dname_t *ow,
+                    const knot_dname_t *catz, uint32_t ord, void *ctx)
+{
+	catalog_upd_val_t *val = malloc(sizeof(*val));
+	if (val == NULL) {
+		return KNOT_ENOMEM;
+	}
+	val->member  = (knot_dname_t *)mem;
+	val->owner   = (knot_dname_t *)ow;
+	val->catzone = (knot_dname_t *)catz;
+	val->ord     = ord;
+	val->type    = MEMB_UPD_ORIG;
+
+	cmtu_ctx_t *cmtu = ctx;
+	if (*cmtu->out_list == NULL) {
+		*cmtu->out_list = val;
+		*cmtu->out_end  = val;
+	} else {
+		(*cmtu->out_end)->next = val;
+		*cmtu->out_end  = val;
+	}
+	return KNOT_EOK;
+}
+
+int catalog_member_to_update(catalog_t *cat, const knot_dname_t *member,
+                             catalog_upd_val_t **out_list, catalog_upd_val_t **out_end)
 {
 	if (cat->ro_txn == NULL) {
 		return KNOT_ENOENT;
 	}
-
-	MDB_val key = knot_lmdb_make_key("BN", 0, member);
-	if (knot_lmdb_find(cat->ro_txn, &key, KNOT_LMDB_EXACT)) {
-		catalog_curval(cat, NULL, NULL, catzone);
-		free(key.mv_data);
-		return KNOT_EOK;
+	cmtu_ctx_t cmtu = { out_list, out_end };
+	int ret = catalog_apply(cat, member, cmtu_add, &cmtu, false, true);
+	if (ret == KNOT_EOK && *out_list == NULL) {
+		ret = KNOT_ENOENT;
 	}
-	free(key.mv_data);
-	return MIN(cat->ro_txn->ret, KNOT_ENOENT);
+	return ret;
+}
+
+static const knot_dname_t *get_uniq(const knot_dname_t *ptr_owner,
+                                    const knot_dname_t *catz)
+{
+	int labels = knot_dname_labels(ptr_owner, NULL);
+	labels -= knot_dname_labels(catz, NULL);
+	assert(labels >= 2);
+	return ptr_owner + knot_dname_prefixlen(ptr_owner, labels - 2, NULL);
+}
+
+static bool same_uniq(const knot_dname_t *owner1, const knot_dname_t *catz1,
+                      const knot_dname_t *owner2, const knot_dname_t *catz2)
+{
+	const knot_dname_t *uniq1 = get_uniq(owner1, catz1), *uniq2 = get_uniq(owner2, catz2);
+	if (*uniq1 != *uniq2) {
+		return false;
+	}
+	return memcmp(uniq1 + 1, uniq2 + 1, *uniq1) == 0;
+}
+
+static int get_zone_cb(const knot_dname_t *mem, const knot_dname_t *ow,
+                       const knot_dname_t *catz, uint32_t ord, void *ctx)
+{
+	UNUSED(mem);
+	UNUSED(ow);
+	UNUSED(ord);
+	uint8_t *storage = ctx;
+	assert(storage[0] == 0);
+	if (knot_dname_store(storage, catz) == 0) {
+		return KNOT_EINVAL;
+	}
+	assert(storage[0] != 0);
+	return KNOT_EOK;
 }
 
 int catalog_get_zone_threadsafe(catalog_t *cat, const knot_dname_t *member,
@@ -315,60 +402,14 @@ int catalog_get_zone_threadsafe(catalog_t *cat, const knot_dname_t *member,
 		return KNOT_ENOENT;
 	}
 
-	MDB_val key = knot_lmdb_make_key("BN", 0, member), val = { 0 };
+	memset(catzone, 0, sizeof(knot_dname_storage_t));
 
-	int ret = knot_lmdb_find_threadsafe(cat->ro_txn, &key, &val, KNOT_LMDB_EXACT);
-	if (ret == KNOT_EOK) {
-		uint8_t zero, shift;
-		const knot_dname_t *ow = NULL;
-		knot_lmdb_unmake_key(val.mv_data, val.mv_size, "BBN", &zero, &shift, &ow);
-		if (knot_dname_store(catzone, ow + shift) == 0) {
-			ret = KNOT_EINVAL;
-		}
-		free(val.mv_data);
+	int ret = catalog_apply(cat, member, get_zone_cb, (uint8_t *)catzone, false, false);
+	if (ret == KNOT_EOK && catzone[0] == 0) {
+		ret = KNOT_ENOENT;
 	}
-	free(key.mv_data);
+
 	return ret;
-}
-
-typedef struct {
-	const knot_dname_t *member;
-	const knot_dname_t *owner;
-	const knot_dname_t *catzone;
-	catalog_find_res_t ret;
-} find_ctx_t;
-
-static int find_cb(MDB_val *key, MDB_val *val, void *fictx)
-{
-	const knot_dname_t *mem, *ow, *cz;
-	catalog_curval2(key, val, &mem, &ow, &cz);
-	find_ctx_t *ctx = fictx;
-	assert(knot_dname_is_equal(mem, ctx->member));
-	if (!knot_dname_is_equal(cz, ctx->catzone)) {
-		ctx->ret = MEMBER_ZONE;
-	} else if (!knot_dname_is_equal(ow, ctx->owner)) {
-		ctx->ret = MEMBER_OWNER;
-	} else {
-		ctx->ret = MEMBER_EXACT;
-	}
-	return KNOT_EOK;
-}
-
-catalog_find_res_t catalog_find(catalog_t *cat, const knot_dname_t *member,
-                                const knot_dname_t *owner, const knot_dname_t *catzone)
-{
-	MDB_val key = knot_lmdb_make_key("BN", 0, member);
-	find_ctx_t ctx = { member, owner, catzone, MEMBER_NONE };
-	int ret = knot_lmdb_apply_threadsafe(cat->ro_txn, &key, false, find_cb, &ctx);
-	free(key.mv_data);
-	switch (ret) {
-	case KNOT_EOK:
-		return ctx.ret;
-	case KNOT_ENOENT:
-		return MEMBER_NONE;
-	default:
-		return MEMBER_ERROR;
-	}
 }
 
 inline static bool same_catalog(knot_lmdb_txn_t *txn, const knot_dname_t *catalog)
@@ -377,7 +418,8 @@ inline static bool same_catalog(knot_lmdb_txn_t *txn, const knot_dname_t *catalo
 		return true;
 	}
 	const knot_dname_t *txn_cat = NULL;
-	catalog_curval2(&txn->cur_key, &txn->cur_val, NULL, NULL, &txn_cat);
+	uint32_t ord = 0;
+	catalog_curval(&txn->cur_key, &txn->cur_val, NULL, NULL, &txn_cat, &ord);
 	return knot_dname_is_equal(txn_cat, catalog);
 }
 
@@ -443,10 +485,12 @@ catalog_update_t *catalog_update_new()
 
 static int freecb(trie_val_t *tval, void *unused)
 {
+	UNUSED(unused);
 	catalog_upd_val_t *val = *tval;
-	if (val != NULL) {
-		freecb((void **)&val->counter, unused);
+	while (val != NULL) {
+		catalog_upd_val_t *next = val->next;
 		free(val);
+		val = next;
 	}
 	return 0;
 }
@@ -472,29 +516,10 @@ void catalog_update_free(catalog_update_t *u)
 	}
 }
 
-static const knot_dname_t *get_uniq(const knot_dname_t *ptr_owner,
-                                    const knot_dname_t *catz)
-{
-	int labels = knot_dname_labels(ptr_owner, NULL);
-	labels -= knot_dname_labels(catz, NULL);
-	assert(labels >= 2);
-	return ptr_owner + knot_dname_prefixlen(ptr_owner, labels - 2, NULL);
-}
-
-static bool same_uniq(const knot_dname_t *owner1, const knot_dname_t *catz1,
-                      const knot_dname_t *owner2, const knot_dname_t *catz2)
-{
-	const knot_dname_t *uniq1 = get_uniq(owner1, catz1), *uniq2 = get_uniq(owner2, catz2);
-	if (*uniq1 != *uniq2) {
-		return false;
-	}
-	return memcmp(uniq1 + 1, uniq2 + 1, *uniq1) == 0;
-}
-
 static catalog_upd_val_t *new_upd_val(const knot_dname_t *member,
                                       const knot_dname_t *owner,
-                                      size_t bail, catalog_upd_type_t type,
-                                      catalog_upd_val_t *counter)
+                                      size_t bail, uint32_t ord,
+                                      catalog_upd_type_t type)
 {
 	size_t member_size = knot_dname_size(member);
 	size_t owner_size = knot_dname_size(owner);
@@ -510,8 +535,28 @@ static catalog_upd_val_t *new_upd_val(const knot_dname_t *member,
 	memcpy(val->member, member, member_size);
 	memcpy(val->owner, owner, owner_size);
 	val->type = type;
-	val->counter = counter;
+	val->next = NULL;
+	val->ord = ord;
 	return val;
+}
+
+static bool upd_cancel_out(catalog_upd_val_t **p_orig, const knot_dname_t *new_owner,
+                           int new_bail, catalog_upd_type_t new_type)
+{
+	catalog_upd_val_t *orig = *p_orig;
+	if (knot_dname_is_equal(orig->owner, new_owner) &&
+	    orig->catzone - orig->owner == new_bail &&
+	    orig->type != new_type) {
+		// same member -- assumed
+		// same owner -- compared
+		// same catz -- "bail" compared
+		// unequal type -- compared
+		// opposite type -- assumed
+		*p_orig = orig->next;
+		free(orig);
+		return true;
+	}
+	return false;
 }
 
 int catalog_update_add(catalog_update_t *u, const knot_dname_t *member,
@@ -528,50 +573,24 @@ int catalog_update_add(catalog_update_t *u, const knot_dname_t *member,
 	uint8_t *lf = knot_dname_lf(member, lf_storage);
 
 	catalog_upd_type_t type = remove ? MEMB_UPD_REM : MEMB_UPD_ADD;
-	catalog_upd_val_t *counter = NULL;
 
-	trie_val_t *found = trie_get_try(u->upd, lf + 1, lf[0]);
-	if (found != NULL) {
-		counter = *found;
-		assert(knot_dname_is_equal(counter->member, member));
-		switch (counter->type) {
-		case MEMB_UPD_ADD:
-		case MEMB_UPD_REM:
-			assert(counter->counter == NULL);
-			if (counter->type == type) {
-				return KNOT_ESEMCHECK;
+	trie_val_t *found = trie_get_ins(u->upd, lf + 1, lf[0]);
+	catalog_upd_val_t **add_to = (catalog_upd_val_t **)found;
+	while (*add_to != NULL) {
+		if (upd_cancel_out(add_to, owner, bail, type)) {
+			if (*found == NULL) { // everything canceled out
+				(void)trie_del(u->upd, lf + 1, lf[0], NULL);
 			}
-			if (knot_dname_is_equal(counter->owner, owner)) { // exact cancelout
-				assert(knot_dname_is_equal(counter->catzone, catzone));
-				trie_del(u->upd, lf + 1, lf[0], NULL);
-				free(counter);
-				return KNOT_EOK;
-			}
-			bool suniq = same_uniq(owner, catzone, counter->owner, counter->catzone);
-			if (type == MEMB_UPD_REM) {
-				counter->type = suniq ? MEMB_UPD_MINOR : MEMB_UPD_UNIQ;
-				counter->counter = new_upd_val(member, owner, bail, type, NULL);
-				return counter->counter != NULL ? KNOT_EOK : KNOT_ENOMEM;
-			}
-			type = suniq ? MEMB_UPD_MINOR : MEMB_UPD_UNIQ;
-			*found = NULL; // counter will be attached to new val
-			break;
-		default:
-			return KNOT_ESEMCHECK;
+			return KNOT_EOK;
 		}
+		add_to = &(*add_to)->next;
 	}
+	// now add_to points at the end of the linked list
 
-	catalog_upd_val_t *val = new_upd_val(member, owner, bail, type, counter);
-	if (val == NULL) {
+	*add_to = new_upd_val(member, owner, bail, 0xdeadbeef, type);
+	if (*add_to == NULL) {
 		return KNOT_ENOMEM;
 	}
-	trie_val_t *added = trie_get_ins(u->upd, lf + 1, lf[0]);
-	if (added == NULL) {
-		free(val);
-		return KNOT_ENOMEM;
-	}
-	assert(*added == NULL);
-	*added = val;
 	return KNOT_EOK;
 }
 
@@ -588,7 +607,6 @@ typedef struct {
 	catalog_update_t *u;
 	const knot_dname_t *apex;
 	bool remove;
-	catalog_t *check;
 } cat_upd_ctx_t;
 
 static int cat_update_add_node(zone_node_t *node, void *data)
@@ -602,11 +620,6 @@ static int cat_update_add_node(zone_node_t *node, void *data)
 	int ret = KNOT_EOK;
 	for (int i = 0; ret == KNOT_EOK && i < ptr->count; i++) {
 		const knot_dname_t *member = knot_ptr_name(rdata);
-		if (ctx->check != NULL && ctx->remove &&
-		    catalog_find(ctx->check, member, node->owner, ctx->apex) != MEMBER_EXACT) {
-			rdata = knot_rdataset_next(rdata);
-			continue;
-		}
 		ret = catalog_update_add(ctx->u, member, node->owner, ctx->apex, ctx->remove);
 		rdata = knot_rdataset_next(rdata);
 	}
@@ -626,7 +639,7 @@ static size_t dname_append(knot_dname_storage_t storage, const knot_dname_t *nam
 }
 
 int catalog_update_from_zone(catalog_update_t *u, struct zone_contents *zone,
-                             bool remove, bool check_ver, catalog_t *check)
+                             bool remove, bool check_ver)
 {
 	if (check_ver && !check_zone_version(zone)) {
 		return KNOT_EZONEINVAL;
@@ -642,10 +655,144 @@ int catalog_update_from_zone(catalog_update_t *u, struct zone_contents *zone,
 		return KNOT_EOK;
 	}
 
-	cat_upd_ctx_t ctx = { u, zone->apex->owner, remove, check };
+	cat_upd_ctx_t ctx = { u, zone->apex->owner, remove };
 	pthread_mutex_lock(&u->mutex);
 	int ret = zone_tree_sub_apply(zone->nodes, sub, false, cat_update_add_node, &ctx);
 	pthread_mutex_unlock(&u->mutex);
+	return ret;
+}
+
+inline static bool same_ow_cat(catalog_upd_val_t *a, catalog_upd_val_t *b)
+{
+	return knot_dname_is_equal(a->owner, b->owner) &&
+	       knot_dname_is_equal(a->catzone, b->catzone);
+}
+
+/*!
+ * \brief TODO huge comment
+ * \param val
+ * \return
+ */
+static int finalize_member(catalog_upd_val_t *val)
+{
+	catalog_upd_val_t *final_cur = val, *orig_first = val, *i, *last = val;
+	if (orig_first->type != MEMB_UPD_ORIG) {
+		orig_first = NULL; // no record in catalog for this member yet
+	}
+
+	uint32_t next_ord = 0;
+
+	while (val != NULL) { // iterate thru linked-list
+		switch (val->type) {
+		case MEMB_UPD_ORIG:
+			next_ord = val->ord + 1;
+			break;
+		case MEMB_UPD_REM:
+			// find what is being removed
+			for (i = final_cur; i != val; i = i->next) {
+				if ((i->type == MEMB_UPD_ORIG || i->type == MEMB_UPD_ADD) && same_ow_cat(i, val)) {
+					// removal of existing record
+					val->ord = i->ord;
+
+					if (i->type == MEMB_UPD_ADD) { // addition cancels out with removal
+						val->type = MEMB_UPD_INVALID;
+						i->type = MEMB_UPD_INVALID;
+					}
+
+					if (i == final_cur) {
+						do { // removal of target first record in cat
+							final_cur = final_cur->next;
+						} while (final_cur != NULL && final_cur->type != MEMB_UPD_ORIG && final_cur->type != MEMB_UPD_ADD);
+					}
+					break; // removal accepted, exit for loop
+				}
+			}
+			if (i == val) { // nothing found to be removed
+				val->type = MEMB_UPD_INVALID;
+			}
+			break;
+		case MEMB_UPD_INVALID:
+			break;
+		case MEMB_UPD_ADD:
+			val->ord = next_ord++;
+			if (final_cur->type != MEMB_UPD_ORIG && final_cur->type != MEMB_UPD_ADD) {
+				final_cur = val;
+			}
+			if (final_cur == val && orig_first != NULL) {
+				val->type = MEMB_UPD_UPD_EFFECT;
+			}
+			break;
+		default:
+			return KNOT_ERROR;
+		}
+		last = val;
+		val = val->next;
+	}
+
+	if (final_cur != orig_first && final_cur != NULL) { // the effective record for this member will be changed
+		switch (final_cur->type) {
+		case MEMB_UPD_ADD:
+			final_cur->type = MEMB_UPD_ADD_EFFECT;
+			break;
+		case MEMB_UPD_ORIG:
+			last->next = new_upd_val(final_cur->member, final_cur->owner,
+			                         bailiwick_shift(final_cur->owner, final_cur->catzone),
+			                         final_cur->ord, MEMB_UPD_UPD_EFFECT);
+			if (last->next == NULL) {
+				return KNOT_ENOENT;
+			}
+			assert(orig_first != NULL);
+			if (!same_uniq(orig_first->owner, orig_first->catzone, final_cur->owner, final_cur->catzone)) {
+				last->next->type = MEMB_UPD_UPD_PURGE;
+			}
+			break;
+		case MEMB_UPD_UPD_EFFECT:
+			assert(orig_first != NULL);
+			if (!same_uniq(orig_first->owner, orig_first->catzone, final_cur->owner, final_cur->catzone)) {
+				final_cur->type = MEMB_UPD_UPD_PURGE;
+			}
+			break;
+		default:
+			assert(0);
+		}
+	} else if (final_cur == NULL && orig_first != NULL) {
+		for (val = orig_first; val != NULL; val = val->next) {
+			if (val->type == MEMB_UPD_REM && same_ow_cat(orig_first, val)) {
+				val->type = MEMB_UPD_REM_EFFECT;
+				break;
+			}
+		}
+		assert(val != NULL);
+	}
+	return KNOT_EOK;
+}
+
+int catalog_update_finalize(catalog_update_t *u, catalog_t *cat)
+{
+	if (u == NULL || cat == NULL) {
+		return KNOT_EINVAL;
+	}
+
+	int ret = KNOT_EOK;
+	catalog_it_t *it = catalog_it_begin(u);
+	while (!catalog_it_finished(it) && ret == KNOT_EOK) {
+		catalog_upd_val_t *val = catalog_it_val(it), *cat_list = NULL, *cat_end = NULL;
+		ret = catalog_member_to_update(cat, val->member, &cat_list, &cat_end);
+		if (ret == KNOT_ENOENT) {
+			ret = finalize_member(val);
+		} else if (ret == KNOT_EOK) {
+			cat_end->next = val; // concatenate linked lists for cat and from cat_upd
+			ret = finalize_member(cat_list);
+			while (cat_list != val) { // free resources from catalog_member_to_update()
+				cat_end = cat_list->next;
+				free(cat_list);
+				cat_list = cat_end;
+			}
+		}
+		catalog_it_next(it);
+	}
+	catalog_it_free(it);
+
 	return ret;
 }
 
@@ -763,19 +910,6 @@ int catalog_update_to_update(catalog_update_t *u, struct zone_update *zu)
 				ret = zone_update_remove(zu, &ptr);
 			}
 			break;
-		case MEMB_UPD_MINOR:
-		case MEMB_UPD_UNIQ:
-			if (val->counter == NULL) {
-				ret = KNOT_ERROR; // some previous error
-			} else if (same_cat) {
-				ret = zone_update_add(zu, &ptr);
-			}
-			if (ret == KNOT_EOK &&
-			    knot_dname_is_equal(zu->zone->name, val->counter->catzone)) {
-				ptr.owner = val->counter->owner;
-				ret = zone_update_remove(zu, &ptr);
-			}
-			break;
 		default:
 			ret = KNOT_EINVAL;
 		}
@@ -793,7 +927,8 @@ typedef struct {
 static int del_all_cb(MDB_val *key, MDB_val *val, void *dactx)
 {
 	const knot_dname_t *mem, *ow, *cz;
-	catalog_curval2(key, val, &mem, &ow, &cz);
+	uint32_t ord = 0;
+	catalog_curval(key, val, &mem, &ow, &cz, &ord);
 	del_all_ctx_t *ctx = dactx;
 	if (knot_dname_is_equal(cz, ctx->zone)) {
 		// TODO possible speedup by indexing which member zones belong to a catalog zone
@@ -817,6 +952,46 @@ int catalog_update_del_all(catalog_update_t *u, catalog_t *cat, const knot_dname
 	return ret;
 }
 
+int catalog_update_commit(catalog_update_t *u, catalog_t *cat)
+{
+	catalog_it_t *it = catalog_it_begin(u);
+	if (catalog_it_finished(it)) {
+		catalog_it_free(it);
+		return KNOT_EOK;
+	}
+	int ret = catalog_begin(cat);
+	while (!catalog_it_finished(it) && ret == KNOT_EOK) {
+		catalog_upd_val_t *val = catalog_it_val(it);
+		while (val != NULL) {
+			switch (val->type) {
+			case MEMB_UPD_ADD:
+			case MEMB_UPD_ADD_EFFECT:
+				ret = catalog_add(cat, val->member, val->owner, val->catzone, val->ord);
+				break;
+			case MEMB_UPD_UPD_EFFECT:
+			case MEMB_UPD_UPD_PURGE:
+				ret = catalog_add(cat, val->member, val->owner, val->catzone, val->ord); // possible re-add with same ord
+				break; // TODO check that already first in catalog ?
+			case MEMB_UPD_REM:
+			case MEMB_UPD_REM_EFFECT:
+				ret = catalog_del(cat, val->member, val->ord);
+				break;
+			case MEMB_UPD_INVALID:
+				break; // no action
+			default:
+				assert(0);
+			}
+			val = val->next;
+		}
+		catalog_it_next(it);
+	}
+	catalog_it_free(it);
+	if (ret == KNOT_EOK) {
+		ret = catalog_commit(cat);
+	}
+	return KNOT_EOK;
+}
+
 static void print_dname(const knot_dname_t *d)
 {
 	knot_dname_txt_storage_t tmp;
@@ -825,51 +1000,60 @@ static void print_dname(const knot_dname_t *d)
 }
 
 static void print_dname3(const char *prefix, const knot_dname_t *a, const knot_dname_t *b,
-                         const knot_dname_t *c)
+                         const knot_dname_t *c, uint32_t ord)
 {
 	printf("%s", prefix);
 	print_dname(a);
 	print_dname(b);
 	print_dname(c);
+	printf("%u\n", ord);
+}
+
+static int catalog_print_cb(const knot_dname_t *mem, const knot_dname_t *ow,
+                            const knot_dname_t *cz, uint32_t ord, void *ctx)
+{
+	print_dname3("", mem, ow, cz, ord);
+	(*(ssize_t *)ctx)++;
+	return KNOT_EOK;
 }
 
 void catalog_print(catalog_t *cat)
 {
 	ssize_t total = 0;
 
-	printf(";; <catalog zone> <record owner> <record zone>\n");
+	printf(";; <catalog zone> <record owner> <record zone> <ord_number>\n");
 
 	if (cat != NULL) {
 		int ret = catalog_open(cat);
+		if (ret == KNOT_EOK) {
+			ret = catalog_apply(cat, NULL, catalog_print_cb, &total, false, true);
+		}
 		if (ret != KNOT_EOK) {
 			printf("Catalog print failed (%s)\n", knot_strerror(ret));
 			return;
 		}
-
-		catalog_foreach(cat) {
-			const knot_dname_t *mem, *ow, *cz;
-			catalog_curval(cat, &mem, &ow, &cz);
-			print_dname3("", mem, ow, cz);
-			total++;
-		}
 	}
 
-	printf("Total zones: %zd\n", total);
+	printf("Total records: %zd\n", total);
 }
 
 void catalog_update_print(catalog_update_t *u)
 {
-	const static char* sign[MEMB_UPD_MAX] = { "! ", "+ ", "- ", "* ", "# " };
+	const static char* sign[MEMB_UPD_MAX] = { " !", " +", " -", " @", "+@", " ^", "^!", "-@" };
 	ssize_t counts[MEMB_UPD_MAX] = { 0 };
 
-	printf(";; <catalog zone> <record owner> <record zone>\n");
+	printf(";; <catalog zone> <record owner> <record zone> <ord_number>\n");
 
 	if (u != NULL) {
 		catalog_it_t *it = catalog_it_begin(u);
 		while (!catalog_it_finished(it)) {
 			catalog_upd_val_t *val = catalog_it_val(it);
-			print_dname3(sign[val->type], val->member, val->owner, val->catzone);
-			counts[val->type]++;
+			while (val != NULL) {
+				assert(val->type < MEMB_UPD_MAX);
+				print_dname3(sign[val->type], val->member, val->owner, val->catzone, val->ord);
+				counts[val->type]++;
+				val = val->next;
+			}
 			catalog_it_next(it);
 		}
 		catalog_it_free(it);
