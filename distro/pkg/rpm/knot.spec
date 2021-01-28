@@ -2,13 +2,12 @@
 %{!?_pkgdocdir: %global _pkgdocdir %{_docdir}/%{name}}
 
 %define GPG_CHECK 0
-%define VERSION __VERSION__
 %define BASE_VERSION %(echo %{version} | sed 's/^\([^.]\+\.[^.]\+\).*/\1/')
 %define repodir %{_builddir}/%{name}-%{version}
 
 Summary:	High-performance authoritative DNS server
 Name:		knot
-Version:	%{VERSION}
+Version:	{{ version }}
 Release:	1%{?dist}
 License:	GPL-3.0-or-later
 URL:		https://www.knot-dns.cz

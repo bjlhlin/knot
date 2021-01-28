@@ -1,0 +1,6 @@
+[project]
+name = "knot-dns"
+# needed for make-archive
+make_archive_script = "scripts/make-dev-archive.sh"
+# needed for get-archive
+upstream_archive_url = "https://gitlab.nic.cz/knot/{{ project.name }}/-/archive/v{{ version }}/{{ project.name }}-v{{ version }}.tar.gz"
