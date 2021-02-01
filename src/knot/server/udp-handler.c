@@ -592,10 +592,8 @@ int udp_master(dthread_t *thread)
 		}
 
 		/* Wait for events. */
-#ifdef USE_AIO
-		struct io_event events[nfds];
-#endif
-		int evs = apoll_ctx_wait(&fds, 0, nfds, -1);
+		apoll_events_init(events, nfds);
+		int evs = apoll_ctx_wait(&fds, events, 0, nfds, -1);
 		if (evs <= 0) {
 			if (errno == EINTR || errno == EAGAIN) {
 				continue;
@@ -605,7 +603,7 @@ int udp_master(dthread_t *thread)
 
 		/* Process the events. */
 		unsigned i = 0;
-		apoll_foreach(&fds) {
+		apoll_foreach(&fds, events) {
 			if (apoll_it_events(it) == 0) {
 				continue;
 			}

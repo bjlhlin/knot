@@ -256,16 +256,14 @@ static void tcp_wait_for_events(tcp_context_t *tcp)
 	unsigned i = tcp->is_throttled ? tcp->client_threshold : 0;
 
 	/* Wait for events. */
-#ifdef USE_AIO
-	struct io_event events[set->n - i]; 
-#endif
-	int nfds = apoll_ctx_wait(set, i, set->n - i, TCP_SWEEP_INTERVAL);
+	apoll_events_init(events, set->n - i); 
+	int nfds = apoll_ctx_wait(set, events, i, set->n - i, TCP_SWEEP_INTERVAL);
 
 	/* Mark the time of last poll call. */
 	tcp->last_poll_time = time_now();
 
 	/* Process events. */
-	apoll_foreach(set) {
+	apoll_foreach(set, events) {
 		bool should_close = false;
 		if (apoll_it_events(it) & (POLLERR|POLLHUP|POLLNVAL)) {
 			should_close = (apoll_it_idx(it) >= tcp->client_threshold);

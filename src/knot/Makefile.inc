@@ -116,6 +116,8 @@ libknotd_la_SOURCES = \
 	knot/common/evsched.h			\
 	knot/common/fdset.c			\
 	knot/common/fdset.h			\
+	knot/common/kqueue_ctx.c		\
+	knot/common/kqueue_ctx.h		\
 	knot/common/log.c			\
 	knot/common/log.h			\
 	knot/common/process.c			\

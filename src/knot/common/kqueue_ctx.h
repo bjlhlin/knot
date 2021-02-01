@@ -20,38 +20,38 @@
 
 #pragma once
 
-#ifdef USE_AIO
+#ifdef USE_KQUEUE
 
 #include <stddef.h>
 #include <signal.h>
+#include <sys/event.h>
 #include <sys/time.h>
-#include <linux/aio_abi.h>
 
-#define FDSET_INIT_SIZE 256 /* Resize step. */
+#define KQUEUE_CTX_INIT_SIZE 256 /* Resize step. */
 
 /*! \brief Set of filedescriptors with associated context and timeouts. */
-typedef struct aio_ctx {
-    aio_context_t ctx;
+typedef struct kqueue_ctx {
+    int ctx;
 	unsigned n;               /*!< Active fds. */
 	unsigned size;            /*!< Array size (allocated). */
-	struct iocb *ev;          /*!< Epoll event storage for each fd */
+	struct kevent *ev;          /*!< Epoll event storage for each fd */
 	void* *usrctx;            /*!< Context for each fd. */
 	time_t *timeout;          /*!< Timeout for each fd (seconds precision). */
-} aio_ctx_t;
+} kqueue_ctx_t;
 
 /*! \brief Mark-and-sweep state. */
-enum aio_ctx_sweep_state {
-	AIO_CTX_KEEP,
-	AIO_CTX_SWEEP
+enum kqueue_ctx_sweep_state {
+	KQUEUE_CTX_KEEP,
+	KQUEUE_CTX_SWEEP
 };
 
 /*! \brief Sweep callback (set, index, data) */
-typedef enum aio_ctx_sweep_state (*aio_ctx_sweep_cb_t)(aio_ctx_t*, int, void*);
+typedef enum kqueue_ctx_sweep_state (*kqueue_ctx_sweep_cb_t)(kqueue_ctx_t *, int, void*);
 
 /*!
  * \brief Initialize fdset to given size.
  */
-int aio_ctx_init(aio_ctx_t *set, unsigned size);
+int kqueue_ctx_init(kqueue_ctx_t *set, unsigned size);
 
 /*!
  * \brief Destroy FDSET.
@@ -59,9 +59,9 @@ int aio_ctx_init(aio_ctx_t *set, unsigned size);
  * \retval 0 if successful.
  * \retval -1 on error.
  */
-int aio_ctx_clear(aio_ctx_t* set);
+int kqueue_ctx_clear(kqueue_ctx_t* set);
 
-void aio_ctx_close(aio_ctx_t* set);
+void kqueue_ctx_close(kqueue_ctx_t* set);
 
 /*!
  * \brief Add file descriptor to watched set.
@@ -74,7 +74,7 @@ void aio_ctx_close(aio_ctx_t* set);
  * \retval index of the added fd if successful.
  * \retval -1 on errors.
  */
-int aio_ctx_add(aio_ctx_t *set, int fd, unsigned events, void *ctx);
+int kqueue_ctx_add(kqueue_ctx_t *set, int fd, unsigned events, void *ctx);
 
 /*!
  * \brief Remove file descriptor from watched set.
@@ -85,9 +85,9 @@ int aio_ctx_add(aio_ctx_t *set, int fd, unsigned events, void *ctx);
  * \retval 0 if successful.
  * \retval -1 on errors.
  */
-int aio_ctx_remove(aio_ctx_t *set, unsigned i);
+int kqueue_ctx_remove(kqueue_ctx_t *set, unsigned i);
 
-int aio_ctx_wait(aio_ctx_t *set, struct io_event *ev, size_t offset, size_t ev_size, int timeout);
+int kqueue_ctx_wait(kqueue_ctx_t *set, struct kevent *ev, size_t offset, size_t ev_size, int timeout);
 
 /*!
  * \brief Set file descriptor watchdog interval.
@@ -105,7 +105,7 @@ int aio_ctx_wait(aio_ctx_t *set, struct io_event *ev, size_t offset, size_t ev_s
  * \retval 0 if successful.
  * \retval -1 on errors.
  */
-int aio_ctx_set_watchdog(aio_ctx_t* set, int i, int interval);
+int kqueue_ctx_set_watchdog(kqueue_ctx_t* set, int i, int interval);
 
 /*!
  * \brief Sweep file descriptors with exceeding inactivity period.
@@ -117,6 +117,6 @@ int aio_ctx_set_watchdog(aio_ctx_t* set, int i, int interval);
  * \retval number of sweeped descriptors.
  * \retval -1 on errors.
  */
-int aio_ctx_sweep(aio_ctx_t* set, aio_ctx_sweep_cb_t cb, void *data);
+int aio_ctx_sweep(kqueue_ctx_t* set, kqueue_ctx_sweep_cb_t cb, void *data);
 
 #endif
