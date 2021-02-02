@@ -251,7 +251,15 @@ int catalog_del(catalog_t *cat, const knot_dname_t *member, uint32_t ord)
 		return KNOT_EINVAL;
 	}
 	MDB_val key = knot_lmdb_make_key("BNI", 0, member, ord);
-	knot_lmdb_del_prefix(cat->rw_txn, &key);
+
+	// backward compatibility with Knot 3.0
+	MDB_val key30 = { key.mv_size - sizeof(ord), key.mv_data };
+	if (ord == 0 && knot_lmdb_find(cat->rw_txn, &key30, KNOT_LMDB_EXACT)) {
+		knot_lmdb_del_cur(cat->rw_txn);
+	} else {
+
+		knot_lmdb_del_prefix(cat->rw_txn, &key);
+	}
 	free(key.mv_data);
 	return cat->rw_txn->ret;
 }
